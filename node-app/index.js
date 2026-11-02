@@ -186,11 +186,14 @@ async function startSingbox() {
     }
     fs.chmodSync(webPath, 0o775);
 
+    log(`[INFO] sing-box 大小: ${fs.statSync(webPath).size} bytes`);
     webProc = spawn(webPath, ["run", "-c", configPath], {
       env: Object.assign({}, GO_BASE_ENV, { GOMEMLIMIT: SINGBOX_MEM_LIMIT }),
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"],
       detached: true
     });
+    webProc.stdout.on("data", (d) => { const t = d.toString().trim(); if (t) log("[sing-box] " + t); });
+    webProc.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) log("[sing-box:err] " + t); });
 
     webProc.on("exit", (code, signal) => {
       if (isExiting) return;
@@ -221,10 +224,12 @@ async function startCloudflared(argoArgs, isFixedTunnel, setArgoLink, updateSubF
       log("[Argo] 检测到域名与 Token，启动固定隧道...");
     }
 
+    log(`[INFO] cloudflared 大小: ${fs.statSync(botPath).size} bytes`);
     botProc = spawn(botPath, [...argoArgs], {
   env: Object.assign({}, GO_BASE_ENV, { GOMEMLIMIT: CLOUDFLARED_MEM_LIMIT }),
   stdio: ["ignore", "pipe", "pipe"], detached: true
     });
+    botProc.stdout.on("data", (d) => { const t = d.toString().trim(); if (t) log("[cloudflared] " + t); });
 
     const activeConnectionsMap = new Map();
     const rl = readline.createInterface({ input: botProc.stderr });
