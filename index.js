@@ -3,6 +3,9 @@ const net = require('net');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const os = require('os');
+const { spawn } = require('child_process');
 
 const UUID_RAW = (process.env.UUID || '').toLowerCase();
 const UUID = UUID_RAW.replace(/-/g, '');
@@ -10,6 +13,10 @@ const HOST = process.env.NODE_HOST || 'lytestkbab.infrlo.com';
 const PORT = process.env.PORT || 5000;
 const WS_PATH = '/' + UUID_RAW + '-vless';
 const LOG = path.join(__dirname, 'app.log');
+const CA_PATH = path.join(__dirname, 'ca.pem');
+const CF_BIN = path.join(__dirname, 'cloudflared');
+let ARGO_DOMAIN = '';
+let cfProc = null;
 
 function log(msg) {
   const line = new Date().toISOString() + ' ' + msg + '\n';
@@ -226,12 +233,84 @@ function handleUpgrade(req, socket, head) {
   };
 }
 
+function downloadFile(url, dest, cb) {
+  const mod = url.startsWith('https:') ? https : http;
+  mod.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+    if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+      res.resume();
+      return downloadFile(res.headers.location, dest, cb);
+    }
+    if (res.statusCode !== 200) {
+      res.resume();
+      return cb(new Error('HTTP ' + res.statusCode));
+    }
+    const f = fs.createWriteStream(dest);
+    res.pipe(f);
+    f.on('finish', () => f.close(() => cb(null)));
+  }).on('error', cb);
+}
+
+function startCloudflared() {
+  const begin = () => {
+    try { fs.writeFileSync(CA_PATH, require('tls').rootCertificates.join('\n')); } catch (e) {}
+    const args = ['tunnel', '--no-autoupdate', '--url', 'http://127.0.0.1:' + PORT, '--protocol', 'http2'];
+    log('[cloudflared] starting: ' + args.join(' '));
+    cfProc = spawn(CF_BIN, args, {
+      env: Object.assign({}, process.env, { SSL_CERT_FILE: CA_PATH, SSL_CERT_DIR: __dirname }),
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const onData = (d) => {
+      for (const line of d.toString().split('\n')) {
+        const t = line.trim();
+        if (!t) continue;
+        log('[cloudflared] ' + t);
+        const m = t.match(/https:\/\/((?!api\.)[a-z0-9-]+\.trycloudflare\.com)/i);
+        if (m) {
+          ARGO_DOMAIN = m[1];
+          log('[argo] tunnel ready: ' + ARGO_DOMAIN);
+          try { fs.writeFileSync(path.join(__dirname, 'argo.txt'), ARGO_DOMAIN + '\n'); } catch (e) {}
+        }
+      }
+    };
+    cfProc.stdout.on('data', onData);
+    cfProc.stderr.on('data', onData);
+    cfProc.on('exit', (code) => {
+      log('[cloudflared] exited code ' + code + ', restarting in 5s');
+      cfProc = null;
+      setTimeout(startCloudflared, 5000);
+    });
+  };
+  if (fs.existsSync(CF_BIN)) {
+    try { fs.chmodSync(CF_BIN, 0o755); } catch (e) {}
+    return begin();
+  }
+  const arch = ['arm64', 'aarch64', 'arm'].includes(os.arch()) ? 'arm64' : 'amd64';
+  const url = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-' + arch;
+  log('[cloudflared] downloading ' + url);
+  downloadFile(url, CF_BIN + '.tmp', (err) => {
+    if (err) { log('[cloudflared] download failed: ' + err.message); return setTimeout(startCloudflared, 10000); }
+    try { fs.renameSync(CF_BIN + '.tmp', CF_BIN); fs.chmodSync(CF_BIN, 0o755); } catch (e) { log('[cloudflared] install failed: ' + e.message); return setTimeout(startCloudflared, 10000); }
+    log('[cloudflared] downloaded ' + fs.statSync(CF_BIN).size + ' bytes');
+    begin();
+  });
+}
+
 const server = http.createServer((req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   if (req.url === '/sub') {
-    const link = 'vless://' + UUID_RAW + '@' + HOST + ':443?encryption=none&security=tls&type=ws&host=' + HOST + '&path=' + encodeURIComponent(WS_PATH) + '&sni=' + HOST + '&fp=chrome#Infrlo-WS';
+    const direct = 'vless://' + UUID_RAW + '@' + HOST + ':443?encryption=none&security=tls&type=ws&host=' + HOST + '&path=' + encodeURIComponent(WS_PATH) + '&sni=' + HOST + '&fp=chrome#Infrlo-Direct';
+    let out = direct + '\n';
+    if (ARGO_DOMAIN) {
+      const cfip = process.env.CFIP || 'www.visa.co.jp';
+      out += 'vless://' + UUID_RAW + '@' + cfip + ':443?encryption=none&security=tls&type=ws&host=' + ARGO_DOMAIN + '&path=' + encodeURIComponent(WS_PATH) + '&sni=' + ARGO_DOMAIN + '&fp=chrome#Infrlo-Argo' + '\n';
+    }
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end(link + '\n');
+    res.end(out);
+    return;
+  }
+  if (req.url === '/argo') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(ARGO_DOMAIN ? ARGO_DOMAIN + '\n' : 'not ready\n');
     return;
   }
   if (req.url && req.url.startsWith('/speed')) {
@@ -255,4 +334,7 @@ function UUIDWithDashes() {
 }
 
 server.on('upgrade', handleUpgrade);
-server.listen(PORT, '0.0.0.0', () => log('[health] listening on ' + PORT + ' path ' + WS_PATH));
+server.listen(PORT, '0.0.0.0', () => {
+  log('[health] listening on ' + PORT + ' path ' + WS_PATH);
+  startCloudflared();
+});
