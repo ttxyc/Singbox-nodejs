@@ -48,6 +48,7 @@ class WSConn {
     socket.on('data', (d) => this.feed(d));
     socket.on('close', () => this.handleClose());
     socket.on('error', () => this.handleClose());
+    socket.on('drain', () => { if (this.onDrain) this.onDrain(); });
   }
   feed(data) {
     this.buffer = Buffer.concat([this.buffer, data]);
@@ -106,10 +107,10 @@ class WSConn {
     }
   }
   sendFrame(data, opcode = 0x2) {
-    if (this.closed) return;
-    try { this.socket.write(wsFrame(data, opcode)); } catch (e) {}
+    if (this.closed) return true;
+    try { return this.socket.write(wsFrame(data, opcode)); } catch (e) { return true; }
   }
-  send(data) { this.sendFrame(data, 0x2); }
+  send(data) { return this.sendFrame(data, 0x2); }
   close() {
     if (this.closed) return;
     this.closed = true;
@@ -182,6 +183,7 @@ function handleUpgrade(req, socket, head) {
     'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n'
   );
   log('[ws] client connected from ' + (socket.remoteAddress || '?'));
+  socket.setNoDelay(true);
   const ws = new WSConn(socket);
   if (head && head.length) ws.feed(head);
   let target = null;
@@ -211,13 +213,14 @@ function handleUpgrade(req, socket, head) {
         ws.send(Buffer.from([0, 0]));
         if (info.rest && info.rest.length) target.write(info.rest);
       });
-      target.on('data', (d) => ws.send(d));
+      target.on('data', (d) => { if (!ws.send(d)) target.pause(); });
       target.on('error', (e) => { log('[tcp] ' + e.message); ws.close(); });
       target.on('close', () => ws.close());
     } else if (target) {
       target.write(payload);
     }
   };
+  ws.onDrain = () => { if (target) target.resume(); };
   ws.onClose = () => {
     if (target) target.destroy();
   };
@@ -229,6 +232,13 @@ const server = http.createServer((req, res) => {
     const link = 'vless://' + UUID_RAW + '@' + HOST + ':443?encryption=none&security=tls&type=ws&host=' + HOST + '&path=' + encodeURIComponent(WS_PATH) + '&sni=' + HOST + '&fp=chrome#Infrlo-WS';
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end(link + '\n');
+    return;
+  }
+  if (req.url && req.url.startsWith('/speed')) {
+    const mb = Math.min(20, Math.max(1, parseInt((req.url.split('mb=')[1] || '5'), 10) || 5));
+    const buf = Buffer.alloc(mb * 1024 * 1024, 0x41);
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': buf.length });
+    res.end(buf);
     return;
   }
   if (req.url === '/log') {
