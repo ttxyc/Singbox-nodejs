@@ -1,0 +1,12 @@
+{
+  "name": "singbox-node-infrlo",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "bash start.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
