@@ -246,9 +246,10 @@ async function startCloudflared(argoArgs, isFixedTunnel, setArgoLink, updateSubF
 
     const onLineHandler = (chunk) => {
       const cleanLine = chunk.replace(/\u001b\[[0-9;]*m/g, "");
+      log("[cloudflared:err] " + cleanLine);
 
       if (!isFixedTunnel) {
-        const domainMatch = cleanLine.match(/https:\/\/([a-zA-Z0-9-]+\.trycloudflare\.com)/);
+        const domainMatch = cleanLine.match(/https:\/\/((?!api\.)[a-zA-Z0-9-]+\.trycloudflare\.com)/);
         if (domainMatch) {
           setArgoLink(domainMatch[1]);
           updateSubFile(true);
@@ -319,7 +320,7 @@ async function main() {
   }
 
   fs.writeFileSync(configPath, JSON.stringify({
-    log: { level: "panic" },
+    log: { level: "info" },
     dns: {
       servers: [
         {
@@ -333,9 +334,8 @@ async function main() {
       cache_capacity: 4096   
     },
     inbounds: inbounds,
-    outbounds: [{ type: "direct", tag: "direct", udp_fragment: true }],
+    outbounds: [{ type: "direct", tag: "direct" }],
     route: {
-      auto_detect_interface: true,
       final: "direct"
     }
   }));
