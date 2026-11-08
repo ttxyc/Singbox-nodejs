@@ -11,11 +11,16 @@ const UUID_RAW = (process.env.UUID || '').toLowerCase();
 const UUID = UUID_RAW.replace(/-/g, '');
 const HOST = process.env.NODE_HOST || 'lytestkbab.infrlo.com';
 const PORT = process.env.PORT || 5000;
+const ARGO_TOKEN = process.env.ARGO_TOKEN || '';
+const FIXED_DOMAIN = process.env.ARGO_DOMAIN || '';
+const CFIP = process.env.CFIP || 'www.visa.co.jp';
+const ARGO_PORTS = (process.env.ARGO_PORTS || '8001,3001')
+  .split(',').map(v => parseInt(v.trim(), 10)).filter(Boolean);
 const WS_PATH = '/' + UUID_RAW + '-vless';
 const LOG = path.join(__dirname, 'app.log');
 const CA_PATH = path.join(__dirname, 'ca.pem');
 const CF_BIN = path.join(__dirname, 'cloudflared');
-let ARGO_DOMAIN = '';
+let ARGO_DOMAIN = FIXED_DOMAIN;
 let cfProc = null;
 
 function log(msg) {
@@ -250,11 +255,26 @@ function downloadFile(url, dest, cb) {
   }).on('error', cb);
 }
 
+function writeArgoLink(domain, tag) {
+  ARGO_DOMAIN = domain;
+  const link = 'vless://' + UUID_RAW + '@' + CFIP + ':443?encryption=none&security=tls&type=ws&host=' +
+    domain + '&path=' + encodeURIComponent(WS_PATH) + '&sni=' + domain + '&fp=chrome#' + (tag || 'Infrlo-Argo');
+  try { fs.writeFileSync(path.join(__dirname, 'argo.txt'), link + '\n'); } catch (e) {}
+  log('[argo] link ready: ' + domain);
+}
+
 function startCloudflared() {
   const begin = () => {
     try { fs.writeFileSync(CA_PATH, require('tls').rootCertificates.join('\n')); } catch (e) {}
-    const args = ['tunnel', '--no-autoupdate', '--url', 'http://127.0.0.1:' + PORT, '--protocol', 'http2'];
-    log('[cloudflared] starting: ' + args.join(' '));
+    let args;
+    if (ARGO_TOKEN) {
+      args = ['tunnel', '--no-autoupdate', '--protocol', 'http2', 'run', '--token', ARGO_TOKEN];
+      log('[cloudflared] starting fixed tunnel: ' + FIXED_DOMAIN);
+      writeArgoLink(FIXED_DOMAIN, 'Infrlo-Argo-Fixed');
+    } else {
+      args = ['tunnel', '--no-autoupdate', '--url', 'http://127.0.0.1:' + PORT, '--protocol', 'http2'];
+      log('[cloudflared] starting quick tunnel');
+    }
     cfProc = spawn(CF_BIN, args, {
       env: Object.assign({}, process.env, { SSL_CERT_FILE: CA_PATH, SSL_CERT_DIR: __dirname }),
       stdio: ['ignore', 'pipe', 'pipe']
@@ -264,11 +284,9 @@ function startCloudflared() {
         const t = line.trim();
         if (!t) continue;
         log('[cloudflared] ' + t);
-        const m = t.match(/https:\/\/((?!api\.)[a-z0-9-]+\.trycloudflare\.com)/i);
-        if (m) {
-          ARGO_DOMAIN = m[1];
-          log('[argo] tunnel ready: ' + ARGO_DOMAIN);
-          try { fs.writeFileSync(path.join(__dirname, 'argo.txt'), ARGO_DOMAIN + '\n'); } catch (e) {}
+        if (!ARGO_TOKEN) {
+          const m = t.match(/https:\/\/((?!api\.)[a-z0-9-]+\.trycloudflare\.com)/i);
+          if (m) writeArgoLink(m[1], 'Infrlo-Argo-Quick');
         }
       }
     };
@@ -295,14 +313,14 @@ function startCloudflared() {
   });
 }
 
-const server = http.createServer((req, res) => {
+function handleRequest(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   if (req.url === '/sub') {
     const direct = 'vless://' + UUID_RAW + '@' + HOST + ':443?encryption=none&security=tls&type=ws&host=' + HOST + '&path=' + encodeURIComponent(WS_PATH) + '&sni=' + HOST + '&fp=chrome#Infrlo-Direct';
     let out = direct + '\n';
     if (ARGO_DOMAIN) {
-      const cfip = process.env.CFIP || 'www.visa.co.jp';
-      out += 'vless://' + UUID_RAW + '@' + cfip + ':443?encryption=none&security=tls&type=ws&host=' + ARGO_DOMAIN + '&path=' + encodeURIComponent(WS_PATH) + '&sni=' + ARGO_DOMAIN + '&fp=chrome#Infrlo-Argo' + '\n';
+      const cfip = CFIP;
+      out += 'vless://' + UUID_RAW + '@' + cfip + ':443?encryption=none&security=tls&type=ws&host=' + ARGO_DOMAIN + '&path=' + encodeURIComponent(WS_PATH) + '&sni=' + ARGO_DOMAIN + '&fp=chrome#' + (ARGO_TOKEN ? 'Infrlo-Argo-Fixed' : 'Infrlo-Argo') + '\n';
     }
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end(out);
@@ -327,14 +345,24 @@ const server = http.createServer((req, res) => {
   }
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('ok');
-});
+}
 
 function UUIDWithDashes() {
   return UUID.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
 }
 
-server.on('upgrade', handleUpgrade);
-server.listen(PORT, '0.0.0.0', () => {
-  log('[health] listening on ' + PORT + ' path ' + WS_PATH);
-  startCloudflared();
+const mainServer = http.createServer(handleRequest);
+mainServer.on('upgrade', handleUpgrade);
+mainServer.listen(PORT, '0.0.0.0', () => {
+  log('[health] listening on 0.0.0.0:' + PORT + ' path ' + WS_PATH);
 });
+
+for (const p of (ARGO_PORTS.length ? ARGO_PORTS : [8001, 3001])) {
+  if (String(p) === String(PORT)) continue;
+  const s = http.createServer(handleRequest);
+  s.on('upgrade', handleUpgrade);
+  s.on('error', (e) => log('[argo] listen ' + p + ' failed: ' + e.message));
+  s.listen(p, '127.0.0.1', () => log('[argo] ws listening on 127.0.0.1:' + p + ' path ' + WS_PATH));
+}
+
+setTimeout(startCloudflared, 1000);
