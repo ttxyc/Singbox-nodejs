@@ -1,0 +1,163 @@
+# Infrlo tunnel watchdog
+#
+# Every 5 minutes, check the fixed Cloudflare tunnel hostname. If it returns
+# Cloudflare error 1033 / HTTP 530 twice in a row, trigger an Infrlo redeploy
+# through the dashboard API.
+#
+# Required repository secret:
+#   INFRLO_COOKIE - Cookie header copied from a logged-in dash.infrlo.com session
+#
+# The session cookie currently expires around 2026-11-28. If the "Get CSRF
+# token" step fails with 401/403, log in to dash.infrlo.com again, copy the new
+# cookie, and update the INFRLO_COOKIE secret.
+#
+# Scheduled workflows run from the default branch (main). The app itself is
+# deployed from the infrlo branch, so this file only lives on main.
+
+name: Infrlo tunnel watchdog
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_redeploy:
+        description: "Skip the health check and trigger a redeploy (test only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infrlo-tunnel-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      APP_ID: ce240a56-70ea-4f44-bf21-7c7deb786259
+      API_BASE: https://haa.infrlo.com
+      TUNNEL_URL: https://infrloly.ttxyc12345.kdns.fr/
+      DASH_ORIGIN: https://dash.infrlo.com
+      UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0"
+
+    steps:
+      - name: Check tunnel health
+        id: health
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          force="${{ github.event.inputs.force_redeploy || 'false' }}"
+          if [ "$force" = "true" ]; then
+            echo "forced unhealthy (workflow_dispatch test)"
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          check() {
+            rm -f /tmp/body
+            local code
+            code="$(curl -sS -o /tmp/body -w '%{http_code}' --max-time 20 "$TUNNEL_URL" || echo 000)"
+            echo "http=$code"
+            head -c 300 /tmp/body 2>/dev/null || true
+            echo
+            [ "$code" = "200" ]
+          }
+
+          if check; then
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "first check failed; retrying in 30s"
+          sleep 30
+
+          if check; then
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "tunnel unhealthy after retry"
+          echo "healthy=false" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Infrlo redeploy
+        id: redeploy
+        if: steps.health.outputs.healthy == 'false'
+        shell: bash
+        env:
+          INFRLO_COOKIE: ${{ secrets.INFRLO_COOKIE }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${INFRLO_COOKIE:-}" ]; then
+            echo "::error::INFRLO_COOKIE secret is missing"
+            exit 1
+          fi
+          echo "::add-mask::$INFRLO_COOKIE"
+
+          AUTH=(-H "Cookie: $INFRLO_COOKIE" -H "User-Agent: $UA")
+
+          echo "Fetching CSRF token..."
+          CSRF="$(curl -fsS "${AUTH[@]}" "$API_BASE/auth/csrf-token" | jq -r '.csrf_token // empty')"
+          if [ -z "$CSRF" ]; then
+            echo "::error::Could not get CSRF token; the Infrlo session cookie may have expired"
+            exit 1
+          fi
+          echo "::add-mask::$CSRF"
+
+          OVERVIEW="$(curl -fsS "${AUTH[@]}" "$API_BASE/api/app/$APP_ID/overview")"
+          STATUS="$(echo "$OVERVIEW" | jq -r '.app.status // empty')"
+          LATEST="$(echo "$OVERVIEW" | jq -r '.latest_deployment.created_at // empty')"
+          echo "app status: $STATUS"
+          echo "latest deployment: $LATEST"
+
+          case "$STATUS" in
+            building|deploying|queued|redeploying)
+              echo "a deployment is already in progress; skipping"
+              exit 0
+              ;;
+          esac
+
+          if [ -n "$LATEST" ]; then
+            latest_epoch="$(date -u -d "${LATEST}Z" +%s 2>/dev/null || echo 0)"
+            now_epoch="$(date -u +%s)"
+            age=$((now_epoch - latest_epoch))
+            echo "latest deployment age: ${age}s"
+            if [ "$age" -ge 0 ] && [ "$age" -lt 600 ]; then
+              echo "a deployment was created less than 10 minutes ago; skipping to avoid a redeploy loop"
+              exit 0
+            fi
+          fi
+
+          echo "Triggering redeploy..."
+          RESP="$(curl -fsS -X POST "${AUTH[@]}" \
+            -H "Origin: $DASH_ORIGIN" \
+            -H "Referer: $DASH_ORIGIN/" \
+            -H "Content-Type: application/json" \
+            -H "X-CSRF-Token: $CSRF" \
+            -d '{"action":"redeploy"}' \
+            "$API_BASE/api/app/$APP_ID/action")"
+          echo "redeploy response: $RESP"
+          echo "$RESP" | jq -e '.deployment_id' >/dev/null
+          echo "triggered=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify recovery
+        if: steps.redeploy.outputs.triggered == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 16); do
+            code="$(curl -sS -o /tmp/body -w '%{http_code}' --max-time 20 "$TUNNEL_URL" || echo 000)"
+            echo "attempt $i: http=$code"
+            if [ "$code" = "200" ]; then
+              echo "tunnel recovered after $((i * 15))s"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::Tunnel is still down after the redeploy"
+          exit 1
